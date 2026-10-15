@@ -1,124 +1,143 @@
-# Newsletter spec: Listmonk + SES
+# Newsletter spec: Listmonk + Email SDK + SES
 
-Build a self-hosted newsletter for one publication. An operator should be able to import subscribers and schedule an issue without touching code. Configure the publication name, timezone and expected sending volume during setup.
+Build a self-hosted newsletter for one publication. Operators prepare and schedule issues in Listmonk. A small Email SDK service delivers each message and records its outcome in Postgres. Configure publication details and expected sending volume during setup.
 
-Use [Listmonk v6.2.0](https://github.com/knadh/listmonk/tree/v6.2.0) as the reviewed baseline. Pin the deployed image digest and record any patches. Preserve Listmonk's AGPL-3.0 license and attribution. Keep changes small and use its existing UI and API.
+Use [Listmonk v6.2.0](https://github.com/knadh/listmonk/tree/v6.2.0) and [Email SDK source `2f89fbc34630`](https://github.com/opencoredev/email-sdk/tree/2f89fbc34630e75685a87f2497cff36378827970) as the reviewed baselines. Pin deployed image digests and the SDK artifact in a lockfile. Verify the selected SDK release contains the APIs used; its example documentation has stale version instructions. Preserve Listmonk's AGPL-3.0 and Email SDK's MIT license notices.
 
-This is an implementation plan. No deployment or live-list testing has been completed. A weekend target is a working staging installation and a controlled pilot. Full migration follows the checks below.
+This is an implementation plan, not a deployed application. A weekend target is staging with fake-provider checks. A live pilot and full migration depend on the acceptance checks passing. The send service and Listmonk handoff patches are required engineering.
 
-Cloudflare provides DNS and protected access. Listmonk and Postgres run on your VPS. Amazon SES delivers the email.
+Cloudflare provides DNS and protected access. Listmonk and the delivery service run on your VPS. SES delivers email through its API.
 
 | Job | Use |
 |---|---|
-| Newsletter application | Listmonk in Docker, deployed with Coolify or Docker Compose |
-| Database | Self-hosted Postgres 16, using Listmonk's schema |
+| Newsletter application | Listmonk in Docker on a VPS, managed by Coolify or Compose |
+| Database | Self-hosted Postgres 16, separate Listmonk and delivery schemas |
 | Public HTTPS and admin access | Cloudflare DNS, Tunnel or secured origin, and Access |
-| Campaign scheduling and sending jobs | Listmonk's built-in manager |
-| Email delivery | Amazon SES SMTP |
-| Bounce and complaint feedback | SES identity notifications through SNS to Listmonk |
-| Uploaded images | Persistent Listmonk media volume |
-| Off-server backups | Private Cloudflare R2 bucket |
+| Campaign preparation and scheduling | Listmonk, with a durable handoff patch |
+| Sending jobs | Node.js delivery service and Postgres worker |
+| Provider integration | Email SDK SES adapter over HTTP |
+| Delivery feedback | SES/SNS to the delivery service, then Listmonk |
+| Media and backups | Persistent media volume; private R2 backups |
 
-**1. Deploy the existing application.**
 
-Deploy one Listmonk instance with Postgres on a private Docker network. Keep the database off the public internet. Run the release's installation/migration command as a controlled step. Persist database and media volumes. Configure health checks and logs.
+**1. Deploy the app and delivery service.**
 
-Use Postgres directly. A self-hosted Supabase Postgres instance is an option if already operated, but Supabase Auth and a database conversion are unnecessary. Keep Listmonk's schema and migration tools.
+Run one Listmonk instance, Postgres 16 and a Node.js 22+ delivery-service container on a private Docker network. Deploy through Coolify or Docker Compose. Persist database and media volumes. Keep the database private and configure health checks.
 
-Done when a fresh installation survives a container restart with a saved draft and subscriber intact.
+Keep Listmonk's schema and migrations. Give the delivery service a separate schema and numbered migrations on the same Postgres server. An existing self-hosted Supabase Postgres instance can host these schemas; Supabase Auth is unnecessary.
 
-**2. Protect administration and keep subscriber links working.**
+Install `@opencoredev/email-sdk` server-side. Disable SDK telemetry with `EMAIL_SDK_TELEMETRY=0` and `telemetry: false`. Start with its memory test adapter and sending disabled.
 
-Put administrative pages and APIs behind Cloudflare Access, retaining Listmonk's own authentication. Use a separate public hostname or explicit route rules for signup, confirmation, unsubscribe, tracking and public images. Inspect the pinned release's routes before writing those rules. Set the canonical public URL so emails contain working subscriber links.
+Done when a restart preserves a draft and a queued test job without sending real email.
 
-Use Cloudflare Tunnel or an origin firewall with authenticated ingress to prevent bypassing Access through the server IP. Protect machine endpoints with service credentials. Keep secrets out of Git and browser responses.
+**2. Protect access and connect Listmonk to the service.**
 
-Done when anonymous users cannot read contacts or start campaigns, while subscriber links work without an administrator login.
+Protect administration with Cloudflare Access and Listmonk authentication. Keep explicit public routes for signup, confirmation, unsubscribe, tracking and images. Use Tunnel or a secured origin to prevent direct-IP bypass. Protect the delivery endpoint with service credentials.
 
-**3. Connect SES SMTP.**
+Use Listmonk's HTTP Postback messenger as the integration seam. Patch its payload to include the final rendered HTML and plain text, reply-to, and generated message headers. The reviewed code omits the alternate body and only forwards campaign-level headers. Preserve one-click unsubscribe headers and Listmonk's subscriber/campaign identifiers.
 
-Verify a sending domain in the chosen AWS region. Configure DKIM and an aligned SPF/DMARC setup; use a custom MAIL FROM domain where appropriate. Create scoped SES SMTP credentials and store them as deployment secrets. Configure TLS and a send rate below the account's allowed rate.
+Persist one immutable send intent per campaign UUID and subscriber UUID before acknowledging the handoff. Use a unique key and payload hash: an identical replay returns the existing intent, while changed content under the same key fails. Test sends and confirmation messages need their own explicit keys. Return HTTP 200 only after durable persistence; Listmonk's postback expects 200.
 
-Confirm production sending access and enough daily quota for the expected campaign size. Send one personalized email per subscriber. Use Listmonk's scheduler; no additional campaign queue is required.
+Listmonk advances its recipient checkpoint before dispatch. Patch the producer so batch intent records are committed in Postgres in the same transaction as that checkpoint, before HTTP handoff. The service drains these records after restart. A postback acknowledgement alone cannot close the earlier crash window. Pause rather than advance if preparation fails.
 
-Done when a test campaign arrives with the expected authentication and working unsubscribe headers.
+Done when termination before or after HTTP handoff leaves every selected recipient accounted for without duplicate intents.
 
-**4. Connect bounce and complaint feedback reliably.**
+**3. Add the persistent send ledger.**
 
-Enable Listmonk bounce processing and the SES webhook at `/webhooks/service/ses`. Configure SES identity feedback notifications for bounces and complaints through SNS, with original headers included and raw message delivery disabled. Use this documented notification shape: the reviewed handler does not treat every configuration-set event shape interchangeably.
+Adapt the SDK's [durable Postgres example](https://github.com/opencoredev/email-sdk/tree/2f89fbc34630e75685a87f2497cff36378827970/packages/email-sdk/examples/durable-postgres). Its persistence code is example application code, not functionality installed by the SDK. Extend its text-only message schema and fingerprint to preserve HTML and required headers. Retain the frozen recipient, content version and provider/account on each intent.
 
-Allow SNS to reach this specific endpoint without an interactive Access login. Retain SNS signature verification. Set hard bounces and complaints to blocklist after the first event; temporary failures must not immediately blocklist a subscriber.
+Use one recipient per job. Validate normalized messages with `email.validate()` before making them dispatchable; unsupported fields must fail visibly. Keep scheduling in Listmonk and the database because neither selected adapter supports `sendAt`. Record attempts and provider receipts. Support `queued`, `inflight`, `accepted`, `failed`, `suppressed` and `needs_reconciliation`. Keep provider delivery events separate from acceptance.
 
-Patch the reviewed handler so a failed bounce database write returns a retryable error instead of HTTP 200. Deduplicate notifications by SNS MessageId, with durable processing state that marks completion only after the effects succeed. A retry after a partial failure must not inflate bounce counts. Verify receiver-side idempotency with repeated notifications.
+Let the Postgres worker own retries: set SDK `retry.maxAttempts: 1` and disable fallback. Automatically retry only outcomes proven not sent. Unknown outcomes, partial results and expired inflight leases stay stopped for review. A stable SDK key does not establish provider-side deduplication.
 
-Done when simulated hard bounces and complaints block future sends, invalid signatures fail, and a temporary database failure is retried successfully.
+Before every new provider attempt, check current Listmonk subscription eligibility and local suppressions. Fail closed if that check fails. Double-opt-in confirmations use their own pending-subscriber rules. Recheck pause/cancel controls too. Pause must stop delivery-service dispatch, not just Listmonk's producer; already submitted messages may arrive.
 
-**5. Import subscribers without changing their choices.**
+Done when duplicate jobs are harmless, an unsubscribe after enqueue prevents sending, and a lost provider response never triggers a blind resend.
 
-Use the existing importer. Supply a small CSV conversion script only where the export needs column mapping. Support email, name, list membership and subscription status; retain available consent dates and source information in subscriber attributes.
+**4. Configure the SES adapter.**
 
-Normalize and deduplicate addresses. Import suppressions before active subscribers. Preserve list-level unsubscribes and globally blocklisted addresses on every reimport. Disable any overwrite option that could reactivate them. Test the same mixed CSV twice. Imported contacts must not receive signup or welcome emails.
+Use `@opencoredev/email-sdk/ses` in the delivery service with the selected region and scoped AWS API credentials. Store secrets outside Git. This path calls SES's HTTP API; SES SMTP credentials are not used.
 
-Use Listmonk's signup form and double opt-in for new public subscribers. Rate-limit the public signup endpoint and verify repeated submissions do not flood an address with confirmation emails.
+Verify the sending domain and configure DKIM with aligned SPF/DMARC. Confirm production access and enough quota for the expected campaign size. Rate-limit provider attempts and record the returned SES MessageId against the intent.
 
-Done when the imported counts reconcile, prior opt-outs remain excluded and new signups need confirmation.
+Preserve Listmonk's campaign/subscriber headers and unsubscribe headers through the adapter. Keep application metadata in Postgres; the SES adapter supports tags but rejects a message-level `metadata` field. Inspect received messages to verify this. The reviewed adapter does not forward the SDK idempotency key to SES; error responses default to an unknown delivery state. Add explicit, tested classification only for responses that prove non-acceptance. Do not treat every server error as safe to retry.
 
-**6. Finish the everyday newsletter workflow.**
+Done when an API test send has a stored receipt, valid authentication and working unsubscribe headers.
 
-Create one reusable single-column template with optional images and a button. Configure the sender and reply-to address. Include a visible unsubscribe link and mailing address. Enable one-click unsubscribe headers and verify the POST endpoint works without login.
+**5. Connect SES feedback to both systems.**
 
-Check subject, preview text, plain-text alternative, personalization fallbacks and test sends in the selected editor. Verify scheduled times against the operator's timezone and store dates consistently. Show the chosen lists and eligible recipient count before sending.
+Configure SES identity bounce/complaint notifications through SNS, including original message headers and with raw delivery disabled. Receive them at a dedicated delivery-service endpoint. Retain Listmonk's existing signature-verification behavior or use a maintained verifier; require the expected SNS topic and validate subscription confirmations. Expose only this provider endpoint through the Access boundary.
 
-Keep Listmonk's reporting. Label SMTP acceptance accurately: it does not prove delivery or inbox placement. Opens and clicks can include automated activity. Record any unavailable provider detail separately instead of inventing metrics.
+Correlate SES `mail.messageId` with the stored receipt and campaign/subscriber identifiers. If delivered counts are required, add configuration-set delivery events and parse their distinct `eventType` shape explicitly. Otherwise label delivered status unavailable; acceptance is not delivery.
 
-Done when an operator can prepare an issue and schedule it, and the received email renders acceptably in Gmail and Outlook.
+Persist authenticated events with a unique `(provider, account, event_id)` key. Commit event receipt, delivery-state changes and local suppression together; return success only after commit. Retain events that arrive before their send receipt and reconcile them once the mapping exists. Use recipient evidence to apply hard-bounce or complaint suppression immediately.
 
-**7. Make interruptions visible and stop unsafe restarts.**
+Use a durable outbox to synchronize suppression and bounce reporting into Listmonk. Make that receiver idempotent and return a retryable error on database failure: the reviewed bounce handler can return 200 after a failed write. Failed synchronization remains queued. Configure first-event blocklisting for hard bounces and complaints, with no immediate permanent block for temporary failures.
 
-The reviewed Listmonk recipient query advances its checkpoint when it fetches a batch. A crash can leave unfinished recipients behind that checkpoint. SMTP also has an uncertain outcome when the connection fails after submission. Do not promise exactly-once delivery.
+The SDK's current webhook normalization covers Resend, Postmark and Mailgun. Implement the provider-specific handler required here. Keep suppression effective if a future provider switch occurs.
 
-Add a startup guard that places previously running campaigns into a paused/review state before the sending manager starts. Keep scheduled campaigns intact. Pause active campaigns before planned deployments. Disable automatic failover or replay of an uncertain campaign through another provider.
+Done when duplicate and early events are handled correctly, a database outage causes retry, and complaints or hard bounces prevent the next send in both systems.
 
-Keep campaign logs and available provider evidence. Provide a review procedure for identifying unresolved recipients. Never replay the whole campaign merely because its totals look wrong. If individual outcomes cannot be established, leave them unresolved for an explicit operator decision. A durable per-recipient send ledger is additional engineering if automatic recovery is required.
+**6. Finish imports and the operator workflow.**
 
-Use a fake SMTP server to test process termination during a batch, rejection and an accepted message followed by a lost response. Confirm the campaign stays stopped after restart and the pause control stops new dispatches; already submitted mail may still arrive.
+Use Listmonk's importer, with a small CSV mapping script if needed. Normalize and deduplicate addresses. Import suppressions first and preserve existing list-level unsubscribes and global blocklisting on every reimport. Retain available consent source/dates. Imported subscribers must not enter welcome automations. Use double opt-in with rate limits for new public signups.
 
-Done when an interruption cannot silently resume sending and the operator can identify which campaign needs review.
+Create a reusable single-column template with optional images and a button. Include a visible unsubscribe link and mailing address. Check personalization fallbacks and plain-text rendering. Ensure subscriber links and one-click unsubscribe work without an administrator login.
 
-**8. Back up, run the pilot and hand over.**
+Route all required mail types through the service, including campaign previews and signup confirmations. The postback path alone does not establish coverage of Listmonk's system notifications; wire and test those explicitly.
 
-Back up Postgres daily and before upgrades to a private R2 bucket with defined retention. Back up uploaded media and document secret recovery separately. Restore into staging with outbound sending disabled. Never restore an old backup straight into an active sender; reconcile newer opt-outs before allowing sends.
+Display the selected audience and eligible count. Verify scheduling against the publication timezone. Keep Listmonk's editor and tracking. Show queued, provider-accepted and delivered counts separately from the ledger. Postback handoff success must not be presented as delivered mail.
 
-Test the changed code and integrations, then send to a small consented pilot audience. Confirm authentication headers and actual inbox placement. Monitor failures and suppression processing. Record the results before moving the full list.
+Done when an operator can import subscribers and schedule an issue, and the received email renders acceptably in Gmail and Outlook.
 
-Deliver a Docker Compose file suitable for Coolify, environment example, setup commands and a short operator guide. Name an owner for failed sends, event failures and backup alerts.
+**7. Prove recovery and controls.**
 
-Done when a restore succeeds and the operator can run a campaign and handle an interruption.
+Test against the memory adapter and a fake provider HTTP endpoint. Terminate the producer around checkpoint commits and the worker before and after provider acceptance. Test duplicate handoffs, lost responses, stale jobs after rescheduling, and pause/cancel while jobs are queued. Verify current opt-outs before dispatch.
 
-## Scope for the first version
+On restart, pause previously active campaigns for review and prevent new attempts for those campaigns until explicitly resumed. Resume known-unsent work from the ledger only. Keep lease-expired and uncertain jobs in `needs_reconciliation`; late events may resolve them without sending again. Require recorded evidence for an operator's retry decision.
 
-Include subscriber management, signup confirmation, imports, scheduled broadcasts, templates, basic segmentation, unsubscribe handling and reporting.
+Keep control state for the delivery worker after Listmonk finishes handing off a campaign. Never replay a whole campaign to repair totals. Pin each intent to its provider/account; provider switching does not reroute unresolved attempts.
 
-A multi-step welcome sequence is not assumed to exist in the reviewed Listmonk release. Treat it as a separate follow-up integration using the API, with its own suppression and retry checks. Do not advertise it as completed. Keep optional AI writing and advanced automation outside this build.
+Done when each selected recipient has an explainable outcome and interrupted work cannot silently skip or resend messages.
 
-## Pilot acceptance
+**8. Back up and run a controlled pilot.**
 
-- Anonymous administration and direct-origin bypass attempts fail.
-- Reimporting a mixed CSV preserves all opt-outs and blocklisted addresses.
-- A cancelled or rescheduled campaign does not send at its old time.
-- Received email has valid authentication and working one-click unsubscribe.
-- SES bounce and complaint notifications prevent the next eligible send.
-- Duplicate feedback does not inflate counts; database failures cause retries.
-- An interrupted campaign stays paused after restart.
-- A backup restores with sending disabled.
+Back up both Postgres schemas daily and before upgrades to private R2 storage with defined retention. Include media and document secret recovery. Restore into staging with all sending disabled. Reconcile newer opt-outs before using any restored data in production.
+
+Retain send-intent keys and receipt mappings beyond the replay window. Preserve suppressions independently of event cleanup. Restrict stored email content and define its retention.
+
+Deliver Compose/Coolify configuration, environment examples and a short operator guide. Include failed-send review and event replay instructions. Monitor reconciliation jobs, feedback failures and backup failures.
+
+Run a small consented live pilot after the tests pass. Inspect authentication and inbox placement in received messages. Record results before moving the full list.
+
+Done when restore and recovery checks pass and the operator can run the newsletter.
+
+## Scope and acceptance
+
+The first version covers subscriber management and scheduled broadcasts, including public signup, imports, templates, segmentation, suppression and reporting. Multi-step welcome sequences and optional AI writing are separate follow-up work.
+
+A pilot requires:
+
+- Protected administration with working public subscriber links.
+- Reimports that preserve every opt-out and trigger no welcome sends.
+- A durable intent for every selected recipient before checkpoint advancement.
+- Correct HTML, plain text and unsubscribe headers through the SDK.
+- No blind retries or automatic provider fallback after uncertain outcomes.
+- Pause/cancel and current subscriber eligibility enforced by the delivery worker.
+- Replay-safe feedback with tested database-failure recovery.
+- Accurate queued/accepted/delivered labels and a restore with sending disabled.
 
 ## Agent guidance
 
-Deploy upstream first. Add only the startup guard and the necessary feedback reliability patch. Do not rebuild the editor or move campaign processing into Workers. Record patches and image digests so upgrades remain reviewable.
+Keep `delivery-service/` and deployment configuration separate from the Listmonk patch set. Preserve the existing editor. Use one provider per deployment initially. The SDK supplies adapters; our application owns the durable queue and suppression policy. No exactly-once delivery claim is made.
 
-Reviewed October 14, 2026.
+Reviewed October 15, 2026. Read the [full SDK reference](https://email-sdk.dev/llms-full.txt) alongside the pinned source. The provider's current API contract takes precedence where the SDK documentation is stale.
 
-- [Listmonk sending manager](https://github.com/knadh/listmonk/blob/v6.2.0/internal/manager/manager.go)
+- [Listmonk HTTP Postback](https://github.com/knadh/listmonk/blob/v6.2.0/internal/messenger/postback/postback.go)
 - [Recipient checkpoints](https://github.com/knadh/listmonk/blob/v6.2.0/queries/campaigns.sql)
 - [Bounce handler](https://github.com/knadh/listmonk/blob/v6.2.0/cmd/bounce.go)
-- [Bounce configuration and webhook format](https://github.com/knadh/listmonk/blob/v6.2.0/docs/docs/content/bounces.md)
+- [Email SDK durable example](https://github.com/opencoredev/email-sdk/tree/2f89fbc34630e75685a87f2497cff36378827970/packages/email-sdk/examples/durable-postgres)
+- [SDK retry implementation](https://github.com/opencoredev/email-sdk/blob/2f89fbc34630e75685a87f2497cff36378827970/packages/email-sdk/src/core/attempts.ts)
+- [SDK webhook support](https://github.com/opencoredev/email-sdk/blob/2f89fbc34630e75685a87f2497cff36378827970/packages/email-sdk/src/webhooks.ts)
+- [SDK SES adapter](https://github.com/opencoredev/email-sdk/blob/2f89fbc34630e75685a87f2497cff36378827970/packages/email-sdk/src/ses.ts)
+- [Listmonk SES feedback configuration](https://github.com/knadh/listmonk/blob/v6.2.0/docs/docs/content/bounces.md)
